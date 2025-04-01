@@ -37,4 +37,7 @@ go run address-generator-ipv6.go input-prefixes 64
 2001:218:fffb::
 ```
 
-
+## Update Version 2
+- Using a subnet generator struct to keep track of status
+- Cycle through one subnet at a time to create reproducible results
+    - as long as the input does not change, the output remains in the same order

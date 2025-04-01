@@ -10,35 +10,61 @@ import (
 	"sync"
 )
 
-func generateSubnets(prefix string, targetPrefixSize int, wg *sync.WaitGroup, out chan<- string) {
-	defer wg.Done()
+// Struct to hold subnet generation state for each prefix
+type subnetGenerator struct {
+	baseIP       *big.Int
+	subnetMask   net.IPMask
+	subnetCount  int
+	currentIndex int
+	increment    *big.Int
+	done         bool
+}
 
+// Generate the next subnet address for this prefix
+func (gen *subnetGenerator) nextSubnet() string {
+	if gen.currentIndex >= gen.subnetCount {
+		gen.done = true // Mark generator as done
+		return ""       // No more subnets to generate
+	}
+
+	// Calculate the subnet IP
+	subnetIP := new(big.Int).Add(gen.baseIP, new(big.Int).Mul(gen.increment, big.NewInt(int64(gen.currentIndex))))
+	subnet := &net.IPNet{
+		IP:   bigIntToIP(subnetIP).Mask(gen.subnetMask),
+		Mask: gen.subnetMask,
+	}
+	gen.currentIndex++
+	return subnet.IP.String() //+ "/" + fmt.Sprint(len(gen.subnetMask) * 8)
+}
+
+// Create a subnet generator for a given prefix
+func createSubnetGenerator(prefix string, targetPrefixSize int) (*subnetGenerator, error) {
 	_, network, err := net.ParseCIDR(prefix)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid prefix: %s\n", prefix)
-		return
+		return nil, fmt.Errorf("Invalid prefix: %s", prefix)
 	}
 
 	networkPrefixSize, _ := network.Mask.Size()
-	if networkPrefixSize == targetPrefixSize {
-		out <- network.IP.String() //+ "/" + fmt.Sprint(targetPrefixSize)
-		return
-	}
+
 	if networkPrefixSize > targetPrefixSize {
-		// If the prefix size is larger than the target, just use the supernet
+		// If the input prefix size is larger than the target, calculate the supernet (larger than the original)
 		supernetMask := net.CIDRMask(targetPrefixSize, 128)
 		supernet := &net.IPNet{
 			IP:   network.IP.Mask(supernetMask),
 			Mask: supernetMask,
 		}
-		out <- supernet.IP.String() //+ "/" + fmt.Sprint(targetPrefixSize)
-		return
+		return &subnetGenerator{
+			baseIP:       ipToBigInt(supernet.IP),
+			subnetMask:   supernet.Mask,
+			subnetCount:  1, // Just one supernet
+			currentIndex: 0,
+			increment:    big.NewInt(0), // No increment needed
+			done:         false,
+		}, nil
 	}
 
 	// Subnet calculation for targetPrefixSize
 	subnetMask := net.CIDRMask(targetPrefixSize, 128)
-
-	// Convert network IP to a big integer to calculate subnets
 	baseIPInt := ipToBigInt(network.IP)
 
 	// Number of subnets we need to generate
@@ -46,17 +72,16 @@ func generateSubnets(prefix string, targetPrefixSize int, wg *sync.WaitGroup, ou
 
 	// Increment each subnet by the size of one subnet block
 	subnetIncrement := big.NewInt(1)
-	subnetIncrement.Lsh(subnetIncrement, uint(128-targetPrefixSize)) // 128 - targetPrefixSize gives the number of hosts per subnet
+	subnetIncrement.Lsh(subnetIncrement, uint(128-targetPrefixSize))
 
-	// Generate each subnet
-	for i := 0; i < subnetCount; i++ {
-		subnetIP := new(big.Int).Add(baseIPInt, new(big.Int).Mul(subnetIncrement, big.NewInt(int64(i))))
-		subnet := &net.IPNet{
-			IP:   bigIntToIP(subnetIP).Mask(subnetMask),
-			Mask: subnetMask,
-		}
-		out <- subnet.IP.String() //+ "/" + fmt.Sprint(targetPrefixSize)
-	}
+	return &subnetGenerator{
+		baseIP:       baseIPInt,
+		subnetMask:   subnetMask,
+		subnetCount:  subnetCount,
+		currentIndex: 0,
+		increment:    subnetIncrement,
+		done:         false,
+	}, nil
 }
 
 // Convert IP to a big integer
@@ -94,26 +119,60 @@ func main() {
 	}
 	defer file.Close()
 
+	// Read all prefixes into a list
+	scanner := bufio.NewScanner(file)
+	var generators []*subnetGenerator
+	for scanner.Scan() {
+		prefix := strings.TrimSpace(scanner.Text())
+		gen, err := createSubnetGenerator(prefix, targetPrefixSize)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating subnet generator: %s\n", err)
+			return
+		}
+		generators = append(generators, gen)
+	}
+
+	if len(generators) == 0 {
+		fmt.Println("No valid prefixes provided.")
+		return
+	}
+
 	// Channel to pass IP addresses
 	addressChan := make(chan string)
 	var wg sync.WaitGroup
 
-	// Start reading prefixes and generating subnets
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		prefix := strings.TrimSpace(scanner.Text())
-		wg.Add(1)
-		go generateSubnets(prefix, targetPrefixSize, &wg, addressChan)
-	}
-
+	// Goroutine to cycle through the generators and send one subnet at a time
+	wg.Add(1)
 	go func() {
-		wg.Wait()
+		defer wg.Done()
+		activeGenerators := len(generators)
+		for activeGenerators > 0 {
+			for _, gen := range generators {
+				if gen.done {
+					continue
+				}
+				subnet := gen.nextSubnet()
+				if subnet != "" {
+					addressChan <- subnet
+				}
+				if gen.done {
+					activeGenerators--
+				}
+			}
+		}
 		close(addressChan)
 	}()
 
 	// Print all addresses from the channel
-	for address := range addressChan {
-		fmt.Println(address)
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for address := range addressChan {
+			fmt.Println(address)
+		}
+	}()
+
+	// Wait for all subnets to be processed and printed
+	wg.Wait()
 }
 
