@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
@@ -13,17 +14,24 @@ import (
 	"sync"
 )
 
-type Arguments struct {
-	PrefixFile       string
-	TargetPrefixSize int
-	TestMode         bool
-	Seed             int64
-	Limit            int
+// Simple prng to generate random 16-bit IPv6-blocks
+type Prng16Bit struct {
+	prng  *rand.Rand
+	value uint16
+}
+
+func (prng *Prng16Bit) Init(seed int64) {
+	prng.prng = rand.New(rand.NewSource(seed))
+}
+
+func (prng *Prng16Bit) Next() uint16 {
+	prng.value = uint16(prng.prng.Intn(1 << 16))
+	return prng.value
 }
 
 // Linear Congruential Generator
 // as described in https://stackoverflow.com/a/53551417
-type lcg_state struct {
+type Lcg struct {
 	value      int64
 	offset     int64
 	multiplier int64
@@ -33,19 +41,15 @@ type lcg_state struct {
 	found      int64
 }
 
-type Lcg struct {
-	lcg_state
-}
-
-func (lcg *Lcg) Init(seed int64, stop int64) {
+func (lcg *Lcg) Init(seed int64, max_count int64, stop int64) {
 	// Seed range with a random integer.
-	//fmt.Println("%d",seed)
-	lcg.value = rand.Int63n(seed)
-	lcg.offset = rand.Int63n(seed)*2 + 1                                  // Pick a random odd-valued offset.
-	lcg.multiplier = 4*(seed/4) + 1                                       // Pick a multiplier 1 greater than a multiple of 4
-	lcg.modulus = int64(math.Pow(2, math.Ceil(math.Log2(float64(seed))))) // Pick a modulus just big enough to generate all numbers (power of 2)
-	lcg.found = 0                                                         // Track how many random numbers have been returned
-	lcg.max = seed
+	//fmt.Println("%d",max_count)
+	lcg.value = rand.Int63n(max_count)
+	lcg.offset = rand.Int63n(max_count)*2 + 1                                  // Pick a random odd-valued offset.
+	lcg.multiplier = 4*(max_count/4) + 1                                       // Pick a multiplier 1 greater than a multiple of 4
+	lcg.modulus = int64(math.Pow(2, math.Ceil(math.Log2(float64(max_count))))) // Pick a modulus just big enough to generate all numbers (power of 2)
+	lcg.found = 0                                                              // Track how many random numbers have been returned
+	lcg.max = max_count
 	lcg.max_iter = stop
 }
 
@@ -72,20 +76,18 @@ func (lcg *Lcg) Max_iterations_reached() bool {
 type subnetGenerator struct {
 	baseIP        *big.Int
 	subnetMask    net.IPMask
-	subnetCount   int
-	currentIndex  int
+	subnetCount   int64
+	currentIndex  int64
 	increment     *big.Int
 	numRandBlocks int
-	n             int
+	n             int64
 	lcg           Lcg
+	prng          Prng16Bit
 	done          bool
-	mode          rune
+	mode          string
 }
 
-func GenerateRandom16Bit() uint16 {
-	return uint16(rand.Intn(1 << 16))
-}
-func IncrementLastNBlocks(num *big.Int, numBlocks int) *big.Int {
+func IncrementLastNBlocks(num *big.Int, numBlocks int, prng Prng16Bit) *big.Int {
 	// Mask and shift values to isolate each 16-bit block
 	var mask uint64 = 0xFFFF
 	newNum := new(big.Int).Set(num) // Make a copy to modify
@@ -97,12 +99,13 @@ func IncrementLastNBlocks(num *big.Int, numBlocks int) *big.Int {
 		block := uint64(oldNum.Rsh(oldNum, shift).Uint64() & mask)
 
 		// Generate a random increment and add to the block (mod 2^16)
-		increment := uint64(GenerateRandom16Bit())
+		increment := uint64(prng.Next())
 		newBlock := (block + increment) & mask
 
 		newNum.Or(newNum, new(big.Int).SetUint64(newBlock<<shift))
 	}
-
+	//fmt.Println("New Increment")
+	//fmt.Println(newNum)
 	return newNum
 }
 
@@ -122,12 +125,18 @@ func (gen *subnetGenerator) nextSubnet() string {
 	}
 
 	subnetIP := new(big.Int).Add(gen.baseIP, new(big.Int).Mul(gen.increment, big.NewInt(nextValue)))
-	subnetIPRand := IncrementLastNBlocks(subnetIP, gen.numRandBlocks)
+	subnetIPRand := IncrementLastNBlocks(subnetIP, gen.numRandBlocks, gen.prng)
+
+	//fmt.Println(bigIntToIP(gen.baseIP))
+	//fmt.Println(bigIntToIP(subnetIP))
+	//fmt.Println(bigIntToIP(subnetIPRand))
+	//fmt.Println("----")
+
 	gen.currentIndex++
 	switch gen.mode {
-	case 'n':
+	case "n":
 		return bigIntToIP(subnetIP).Mask(gen.subnetMask).String()
-	case 'r':
+	case "r":
 		return bigIntToIP(subnetIPRand).String()
 	default:
 		return bigIntToIP(subnetIP).Mask(gen.subnetMask).String() + "\n" + bigIntToIP(subnetIPRand).String()
@@ -135,7 +144,7 @@ func (gen *subnetGenerator) nextSubnet() string {
 }
 
 // Create a subnet generator for a given prefix
-func createSubnetGenerator(prefix string, targetPrefixSize int, n int, mode rune) (*subnetGenerator, error) {
+func createSubnetGenerator(prefix string, targetPrefixSize int, n int64, mode string) (*subnetGenerator, error) {
 	_, network, err := net.ParseCIDR(prefix)
 	if err != nil {
 		return nil, fmt.Errorf("Invalid prefix: %s", prefix)
@@ -144,6 +153,13 @@ func createSubnetGenerator(prefix string, targetPrefixSize int, n int, mode rune
 	networkPrefixSize, _ := network.Mask.Size()
 
 	var lcg Lcg
+	//Init 16 bit prng for traversing random subnets
+	var prng Prng16Bit
+	var prngSeed int64
+	// needed for initialization of the prng
+	// we use the given ip prefix as a start seed to generate the subnets
+	// advantage: seed is unique per prefix but also good for reproducible results
+	var tmpInt big.Int
 
 	if networkPrefixSize > targetPrefixSize {
 		// If the input prefix size is larger than the target, calculate the supernet (larger than the original)
@@ -152,8 +168,11 @@ func createSubnetGenerator(prefix string, targetPrefixSize int, n int, mode rune
 			IP:   network.IP.Mask(supernetMask),
 			Mask: supernetMask,
 		}
+		baseIPInt := ipToBigInt(supernet.IP)
+		prngSeed = tmpInt.Rsh(baseIPInt, 64).Int64()
+		prng.Init(prngSeed)
 		return &subnetGenerator{
-			baseIP:        ipToBigInt(supernet.IP),
+			baseIP:        baseIPInt,
 			subnetMask:    supernet.Mask,
 			subnetCount:   1, // Just one supernet
 			currentIndex:  0,
@@ -161,6 +180,7 @@ func createSubnetGenerator(prefix string, targetPrefixSize int, n int, mode rune
 			numRandBlocks: (128 - targetPrefixSize) / 16,
 			n:             n,
 			lcg:           lcg,
+			prng:          prng,
 			done:          false,
 			mode:          mode,
 		}, nil
@@ -170,11 +190,15 @@ func createSubnetGenerator(prefix string, targetPrefixSize int, n int, mode rune
 	subnetMask := net.CIDRMask(targetPrefixSize, 128)
 	baseIPInt := ipToBigInt(network.IP)
 
+	//fmt.Println(baseIPInt)
+	//fmt.Println(tmpInt.Rsh(baseIPInt, 64))
+	prngSeed = tmpInt.Rsh(baseIPInt, 64).Int64()
+	prng.Init(prngSeed)
 	// Number of subnets we need to generate
-	subnetCount := 1 << (targetPrefixSize - networkPrefixSize)
-	// Set max lcg value to subnet count
+	subnetCount := int64(1 << (targetPrefixSize - networkPrefixSize))
+	// Set max lcg value to subnet count -- deprecated
 	//fmt.Println(network.IP.String())
-	lcg.Init(int64(subnetCount), int64(n))
+	lcg.Init(prngSeed, subnetCount, n)
 
 	// Increment each subnet by the size of one subnet block
 	subnetIncrement := big.NewInt(1)
@@ -189,6 +213,7 @@ func createSubnetGenerator(prefix string, targetPrefixSize int, n int, mode rune
 		numRandBlocks: (128 - targetPrefixSize) / 16,
 		n:             n,
 		lcg:           lcg,
+		prng:          prng,
 		done:          false,
 		mode:          mode,
 	}, nil
@@ -210,56 +235,86 @@ func bigIntToIP(ipInt *big.Int) net.IP {
 	return ip
 }
 
+type Arguments struct {
+	ConfigFile       string
+	Mode             string
+	PrefixFile       string
+	TargetSubnetSize int
+	PerPrefixLimit   int64
+	TotalLimit       int64
+	Seed             int64
+}
+
+/*func parseArguments() Arguments {
+	args := Arguments{}
+	flag.StringVar(&args.PrefixFile, "prefix-file", "", "Path to input prefix file")
+	flag.IntVar(&args.TargetSubnetSize, "target-subnet-size", 48, "Target size of generated subnets (default 48)")
+	flag.StringVar(&args.Mode, "mode", "n", "Operating mode -- generate network (n, default), random (r), or both (b) addresses")
+	flag.Int64Var(&args.Seed, "seed", 1337371717283484832, "Random seed for LCG (optional, default is 1337371717283484832)")
+	flag.Int64Var(&args.PerSubnetLimit, "limit-per-prefix", -1, "Limit number of generated subnets per prefix (-1 -> no limit, default)")
+	flag.Int64Var(&args.TotalLimit, "total-limit", -1, "Limit number of generated subnets globally (-1 -> no limit, default)")
+	flag.Parse()
+	return args
+}*/
+
 func parseArguments() Arguments {
 	args := Arguments{}
-	flag.StringVar(&args.PrefixFile, "prefix", "", "Path to prefix file")
-	flag.IntVar(&args.TargetPrefixSize, "size", 0, "Target prefix size")
-	flag.BoolVar(&args.TestMode, "test-mode", false, "Enable test mode")
-	flag.Int64Var(&args.Seed, "seed", 0, "Random seed for LCG")
-	flag.IntVar(&args.Limit, "limit", 1000, "Number of values to generate (default 1000 in test mode)")
+
+	flag.StringVar(&args.ConfigFile, "config-file", "", "Path to config file")
+	flag.StringVar(&args.PrefixFile, "prefix-file", "", "Path to input prefix file")
+	flag.IntVar(&args.TargetSubnetSize, "target-subnet-size", 48, "Target size of generated subnets (default 48)")
+	flag.StringVar(&args.Mode, "mode", "n", "Operating mode -- generate network (n, default), random (r), or both (b) addresses")
+	flag.Int64Var(&args.Seed, "seed", 1337371717283484832, "Random seed for LCG (optional, default is 1337371717283484832)")
+	flag.Int64Var(&args.PerPrefixLimit, "limit-per-prefix", -1, "Limit number of generated subnets per prefix (-1 -> no limit, default)")
+	flag.Int64Var(&args.TotalLimit, "total-limit", -1, "Limit number of generated subnets globally (-1 -> no limit, default)")
 	flag.Parse()
+
+	if args.ConfigFile != "" {
+		file, err := os.Open(args.ConfigFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening config file: %s\n", err)
+			os.Exit(1)
+		}
+		defer file.Close()
+
+		decoder := json.NewDecoder(file)
+		//configArgs := Arguments{}
+		if err := decoder.Decode(&args); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing config file: %s\n", err)
+			os.Exit(1)
+		}
+		//fmt.Println(args)
+	}
+
 	return args
 }
 
 func main() {
-	if len(os.Args) < 4 {
-		fmt.Println("[*] Usage: go run sra_generation.go [prefix file] [target prefix size] [set generation mode r (random), n (network; default) or b (both)] [optional: generate at most n addresses per subnet]")
+	args := parseArguments()
+
+	if args.PrefixFile == "" {
+		fmt.Println("[*] No input file in CIDR prefix notation provided. (--prefix-file/Prefix-File)")
+		fmt.Println("Usage: go run sra_generation_cyclic-v4.go --prefix-file <file> --target-subnet-size <target size> --mode <n (default), r, b> --limit-per-prefix <int, default -1 (no limit) --total-limit <max. amount of generated subnets> --seed <seed for lcg>")
+		fmt.Println("   Or: go run sra_generation_cyclic-v4.go --config-file <file>")
 		return
 	}
 
-	prefixFile := os.Args[1]
-	targetPrefixSize := 0
-	fmt.Sscanf(os.Args[2], "%d", &targetPrefixSize)
-
-	genMode := 'n'
-	fmt.Sscanf(os.Args[3], "%c", &genMode)
-	switch genMode {
-	case 'n':
-	case 'r':
-	case 'b':
-	default:
-		fmt.Println("Generation mode only allows r,n, or b")
-		fmt.Println("[*] Usage: go run sra_generation.go [prefix file] [target prefix size] [set generation mode r (random), n (network; default) or b (both)] [optional: generate at most n addresses per subnet    ]")
-		return
-	}
-	// Limit number of generated addresses per subnet to n
-	n := 0
-	if len(os.Args) == 5 {
-		fmt.Sscanf(os.Args[4], "%d", &n)
-	}
-	file, err := os.Open(prefixFile)
+	file, err := os.Open(args.PrefixFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening file: %s\n", err)
 		return
 	}
 	defer file.Close()
 
+	// initialize random generator with static seed
+	rand.Seed(args.Seed)
+
 	// Read all prefixes into a list
 	scanner := bufio.NewScanner(file)
 	var generators []*subnetGenerator
 	for scanner.Scan() {
 		prefix := strings.TrimSpace(scanner.Text())
-		gen, err := createSubnetGenerator(prefix, targetPrefixSize, n, genMode)
+		gen, err := createSubnetGenerator(prefix, args.TargetSubnetSize, args.PerPrefixLimit, args.Mode)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating subnet generator: %s\n", err)
 			return
@@ -271,7 +326,7 @@ func main() {
 		fmt.Println("No valid prefixes provided.")
 		return
 	}
-
+	//fmt.Println(len(generators))
 	// Channel to pass IP addresses
 	addressChan := make(chan string)
 	var wg sync.WaitGroup
@@ -281,14 +336,29 @@ func main() {
 	go func() {
 		defer wg.Done()
 		activeGenerators := len(generators)
-		for activeGenerators > 0 {
+		// needs to be float to be able to compare with math.Inf
+		generatedSubnets := float64(0)
+		var maxGeneratedSubnets float64
+		if args.TotalLimit == -1 {
+			maxGeneratedSubnets = math.Inf(1)
+		} else {
+			maxGeneratedSubnets = float64(args.TotalLimit)
+		}
+		//fmt.Println(maxGeneratedSubnets)
+		//fmt.Println(generatedSubnets)
+		for activeGenerators > 0 && generatedSubnets < maxGeneratedSubnets {
 			for _, gen := range generators {
+				if generatedSubnets >= (maxGeneratedSubnets) {
+					//fmt.Println("Done generating subnets.")
+					break
+				}
 				if gen.done {
 					continue
 				}
 				subnet := gen.nextSubnet()
 				if subnet != "" {
 					addressChan <- subnet
+					generatedSubnets++
 				}
 				if gen.done {
 					activeGenerators--
