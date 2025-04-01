@@ -1,0 +1,9 @@
+{
+  "PrefixFile": "./input-prefixes",
+  "TargetSubnetSize": 48,
+  "Mode": "b",
+  "Seed": 133371717287384832,
+  "PerPrefixLimit": 1,
+  "TotalLimit": 100
+}
+
