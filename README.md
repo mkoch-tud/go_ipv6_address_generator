@@ -41,3 +41,5 @@ go run address-generator-ipv6.go input-prefixes 64
 - Using a subnet generator struct to keep track of status
 - Cycle through one subnet at a time to create reproducible results
     - as long as the input does not change, the output remains in the same order
+## Update Version 3
+- Added pseudo-random generator (LCG) to traverse address space in a pseudo-random, reproducible fashion.
