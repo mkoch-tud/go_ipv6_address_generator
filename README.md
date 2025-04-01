@@ -21,7 +21,7 @@ One Prefix per line.
 ## Example config file structure
 ```
 {
-  "PrefixFile": "./input-prefixes",
+  "PrefixFile": "../input/input-prefixes",
   "TargetSubnetSize": 48,
   "Mode": "b",
   "Seed": 133371717287384832,
@@ -51,11 +51,11 @@ go run sra_generation_cyclic-v4.go --config-file <file>
 ## Example
 Use the `input-prefixes` file as input and generate /48 addresses
 ```
-go run address-generator-ipv6.go input-prefixes 48 b 1
+go run address-generator-ipv6.go --prefix-file input/input-prefixes --target-subnet-size 48 --mode b --limit-per-prefix 1 --total-limit 100
 ```
 or
 ```
-go run address-generator-ipv6.go --config-file config-go-tool 
+go run address-generator-ipv6.go --config-file config/config-go-tool 
 ```
 ### Example output
 ```

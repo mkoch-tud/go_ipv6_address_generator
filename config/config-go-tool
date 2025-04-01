@@ -1,5 +1,5 @@
 {
-  "PrefixFile": "./input-prefixes",
+  "PrefixFile": "../input/input-prefixes",
   "TargetSubnetSize": 48,
   "Mode": "b",
   "Seed": 133371717287384832,
