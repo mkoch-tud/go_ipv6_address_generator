@@ -49,7 +49,7 @@ One Prefix per line.
 | `--limit-per-prefix <int>`    | `"PerPrefixLimit"`  | Max number of addresses per given prefix, `-1` disables limit | No       | `-1`         |
 | `--total-limit <max>`         | `"TotalLimit"`      | Maximum number of generated addresses, `-1` disables limit | No       | `-1`         |
 | `--seed <seed>`               | `"Seed"`           | Seed value for the linear congruential generator   | No       | 1337371717283484832 |
-| `--blocklist-file <file>`               | `"BlocklistFile"`           | Path to blocklist file   | No       | configs/blocklist.conf |
+| `--blocklist-file <file>`               | `"BlocklistFile"`           | Path to blocklist file   | No       | config/blocklist.conf |
 
 ## Usage
 ```
