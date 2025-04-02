@@ -18,6 +18,15 @@ One Prefix per line.
 2001:218::/32
 ```
 
+## Structure of Blocklist File
+```
+# IPv6 Blocklist file
+2001:0:469e:0:aad9:5c1c:1b08:879e
+
+2001:200:90a7::/48 # Testing to block prefixes
+2001:200:eb99:100::/64
+```
+
 ## Example config file structure
 ```
 {
@@ -26,7 +35,8 @@ One Prefix per line.
   "Mode": "b",
   "Seed": 133371717287384832,
   "PerPrefixLimit": 1,
-  "TotalLimit": 100
+  "TotalLimit": 100,
+  "BlocklistFile": "config/blocklist.conf"
 }
 ```
 
@@ -34,15 +44,16 @@ One Prefix per line.
 | Command Line Argument           | Config File Key     | Description                                          | Required | Default Value |
 |---------------------------------|---------------------|------------------------------------------------------|----------|--------------|
 | `--prefix-file <file>`         | `"PrefixFile"`      | Path to the input prefix file                        | Yes      | N/A          |
-| `--target-subnet-size <size>`  | `"TargetSubnetSize"`| Size of the generated target subnets (e.g., 48 for /48) | Yes      | N/A          |
+| `--target-subnet-size <size>`  | `"TargetSubnetSize"`| Size of the generated target subnets (e.g., 48 for /48) | No      | 48          |
 | `--mode <n, r, b>`            | `"Mode"`           | Mode selection: `n`, `r`, or `b`         | No       | `n`          |
 | `--limit-per-prefix <int>`    | `"PerPrefixLimit"`  | Max number of addresses per given prefix, `-1` disables limit | No       | `-1`         |
 | `--total-limit <max>`         | `"TotalLimit"`      | Maximum number of generated addresses, `-1` disables limit | No       | `-1`         |
-| `--seed <seed>`               | `"Seed"`           | Seed value for the linear congruential generator   | No       | N/A
+| `--seed <seed>`               | `"Seed"`           | Seed value for the linear congruential generator   | No       | 1337371717283484832 |
+| `--blocklist-file <file>`               | `"BlocklistFile"`           | Path to blocklist file   | No       | configs/blocklist.conf |
 
 ## Usage
 ```
-go run sra_generation_cyclic-v4.go --prefix-file <file> --target-subnet-size <target size> --mode <n (default), r, b> --limit-per-prefix <int, default -1 (no limit) --total-limit <max. amount of generated addresses> --seed <seed for lcg>
+go run sra_generation_cyclic-v4.go --prefix-file <file> --target-subnet-size <target size> --mode <n (default), r, b> --limit-per-prefix <int, default -1 (no limit) --total-limit <max. amount of generated addresses> --seed <seed for lcg> --blocklist-file <file>
 ```
 or
 ```
@@ -59,26 +70,27 @@ go run address-generator-ipv6.go --config-file config/config-go-tool
 ```
 ### Example output
 ```
-2001:0:f582::
-2001:0:f582:0:aad9:5c1c:1b08:879e
+2001:0:469e::
 2001:2::
-2001:2::aa1:9ab4:8a2f:6119
+Skipping blocked addresses for prefix 2001:200:90a7::/48: 2001:200:90a7:: and 2001:200:90a7:0:ab6e:7096:e335:5176
 2001:4:112::
-2001:4:112:0:f66f:d995:ee7d:dfac
-2001:200:6c16::
-2001:200:6c16:0:ab6e:7096:e335:5176
-2001:200:6af::
-2001:200:6af:0:6ea0:f6b6:696a:1f7e
-2001:200:9a7::
-2001:200:9a7:0:6845:f3bd:6a8a:e4a2
-2001:200:e89::
-2001:200:e89:0:924d:766f:4cf9:1865
-2001:200:ca1e::
-2001:200:ca1e:0:34:2294:9174:8017
-2001:200:ffad::
-2001:200:ffad:0:e26d:e970:e779:a606
-2001:218:33d3::
-2001:218:33d3:0:1763:ead9:3772:9411
+2001:200:286a::
+2001:200:6fd::
+2001:200:60c3::
+2001:200:97d::
+2001:200:eba::
+2001:200:d86f::
+2001:200:eb99::
+2001:218:a39f::
+2001:0:e1a7::
+2001:200:c02d::
+2001:200:6de::
+2001:200:60c6::
+2001:200:978::
+2001:200:ec1::
+2001:200:d974::
+2001:200:e3ec::
+2001:218:5aa::
 ```
 
 ## Update Version 2
@@ -98,3 +110,9 @@ go run address-generator-ipv6.go --config-file config/config-go-tool
 - Added go flags to parse arguments
 - Added option for config file in json format to ease generator setup
 - Added total-limit option, algorithm will stop after generating [X] addresses
+## Update Version 6
+- Fixed random subnet generator to use a static seed for reproducible results
+- Implemented blocklist feature
+    - Add --blocklist-file argument
+    - Make ZMap blocklist structure work
+- Printing informational log messages to stderr

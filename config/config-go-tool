@@ -1,9 +1,10 @@
 {
-  "PrefixFile": "../input/input-prefixes",
+  "PrefixFile": "input/input-prefixes",
   "TargetSubnetSize": 48,
-  "Mode": "b",
+  "Mode": "n",
   "Seed": 133371717287384832,
-  "PerPrefixLimit": 1,
-  "TotalLimit": 100
+  "PerPrefixLimit": 2,
+  "TotalLimit": 100,
+  "BlocklistFile": "config/blocklist.conf2"
 }
 

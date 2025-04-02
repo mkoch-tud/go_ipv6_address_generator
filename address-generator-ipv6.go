@@ -14,6 +14,43 @@ import (
 	"sync"
 )
 
+
+// Read blocklist file and parse IPv6 prefixes to exclude them from scans
+func readBlocklist(filename string) ([]*net.IPNet, error) {
+    file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var prefixes []*net.IPNet
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines or comment lines
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Remove inline comments
+		if idx := strings.Index(line, "#"); idx != -1 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		// Ensure it's a valid IPv6 CIDR or address
+		if !strings.Contains(line, "/") {
+			line += "/128" // Convert single address to CIDR notation
+		}
+		_, ipNet, err := net.ParseCIDR(line)
+		if err != nil {
+			return nil, fmt.Errorf("invalid IPv6 prefix: %s", line)
+		}
+		prefixes = append(prefixes, ipNet)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return prefixes, nil
+}
+
 // Simple prng to generate random 16-bit IPv6-blocks
 type Prng16Bit struct {
 	prng  *rand.Rand
@@ -39,13 +76,18 @@ type Lcg struct {
 	max        int64
 	max_iter   int64
 	found      int64
+    prng       *rand.Rand
 }
 
 func (lcg *Lcg) Init(seed int64, max_count int64, stop int64) {
 	// Seed range with a random integer.
 	//fmt.Println("%d",max_count)
-	lcg.value = rand.Int63n(max_count)
-	lcg.offset = rand.Int63n(max_count)*2 + 1                                  // Pick a random odd-valued offset.
+	lcg.prng = rand.New(rand.NewSource(seed))
+	lcg.value = lcg.prng.Int63n(max_count)
+	lcg.offset = lcg.prng.Int63n(max_count)*2 + 1                                  // Pick a random odd-valued offset.
+    //fmt.Println("%d",lcg.value)
+    //fmt.Println("%d",lcg.offset)
+    //fmt.Println("%d",max_count)
 	lcg.multiplier = 4*(max_count/4) + 1                                       // Pick a multiplier 1 greater than a multiple of 4
 	lcg.modulus = int64(math.Pow(2, math.Ceil(math.Log2(float64(max_count))))) // Pick a modulus just big enough to generate all numbers (power of 2)
 	lcg.found = 0                                                              // Track how many random numbers have been returned
@@ -85,6 +127,18 @@ type subnetGenerator struct {
 	prng          Prng16Bit
 	done          bool
 	mode          string
+    hasBlockedIPs bool
+    blocklist     []*net.IPNet
+}
+
+// Checks if a given prefix is within any blocked subnets
+func isBlocked(ipNet *net.IPNet, blocklist []*net.IPNet) bool {
+	for _, blocked := range blocklist {
+		if blocked.Contains(ipNet.IP) {
+			return true
+		}
+	}
+	return false
 }
 
 func IncrementLastNBlocks(num *big.Int, numBlocks int, prng Prng16Bit) *big.Int {
@@ -124,30 +178,67 @@ func (gen *subnetGenerator) nextSubnet() string {
 		return ""
 	}
 
-	subnetIP := new(big.Int).Add(gen.baseIP, new(big.Int).Mul(gen.increment, big.NewInt(nextValue)))
-	subnetIPRand := IncrementLastNBlocks(subnetIP, gen.numRandBlocks, gen.prng)
+	subnetIPInt := new(big.Int).Add(gen.baseIP, new(big.Int).Mul(gen.increment, big.NewInt(nextValue)))
+	subnetIPRandInt := IncrementLastNBlocks(subnetIPInt, gen.numRandBlocks, gen.prng)
 
+    subnetIP := bigIntToIP(subnetIPInt).Mask(gen.subnetMask)
+    subnetIPRand := bigIntToIP(subnetIPRandInt)
 	//fmt.Println(bigIntToIP(gen.baseIP))
-	//fmt.Println(bigIntToIP(subnetIP))
-	//fmt.Println(bigIntToIP(subnetIPRand))
+	//fmt.Println(subnetIP.String())
+	//fmt.Println(subnetIPRand.String())
 	//fmt.Println("----")
 
+    if gen.hasBlockedIPs {
+		for _,blocked := range gen.blocklist {
+			if (blocked.Contains(subnetIP) && (gen.mode=="n" || gen.mode=="b")) ||
+            (blocked.Contains(subnetIPRand) && (gen.mode=="r" || gen.mode=="b")){
+				fmt.Fprintf(os.Stderr, "Skipping blocked addresses for prefix %s: %s and %s\n", blocked.String(),subnetIP, subnetIPRand)
+	            //fmt.Println(bigIntToIP(gen.baseIP))
+                //fmt.Println("---")
+                return gen.nextSubnet() // Recursively get the next valid address
+			}
+		}
+    }
+    
 	gen.currentIndex++
+    //fmt.Println("+++")
+	//fmt.Println(bigIntToIP(gen.baseIP))
+    //fmt.Println(subnetIP.String())
+    //fmt.Println(subnetIPRand.String())
+    //fmt.Println("+++")
+
 	switch gen.mode {
 	case "n":
-		return bigIntToIP(subnetIP).Mask(gen.subnetMask).String()
+		return subnetIP.String()
 	case "r":
-		return bigIntToIP(subnetIPRand).String()
+		return subnetIPRand.String()
 	default:
-		return bigIntToIP(subnetIP).Mask(gen.subnetMask).String() + "\n" + bigIntToIP(subnetIPRand).String()
+		return subnetIP.String() + "\n" + subnetIPRand.String()
 	}
 }
 
 // Create a subnet generator for a given prefix
-func createSubnetGenerator(prefix string, targetPrefixSize int, n int64, mode string) (*subnetGenerator, error) {
+func createSubnetGenerator(prefix string, targetPrefixSize int, n int64, mode string, blocklist []*net.IPNet) (*subnetGenerator, error) {
 	_, network, err := net.ParseCIDR(prefix)
 	if err != nil {
 		return nil, fmt.Errorf("Invalid prefix: %s", prefix)
+	}
+    // Skip generator if prefix is subnet of blocked network
+    if isBlocked(network, blocklist){
+        fmt.Fprintf(os.Stderr, "Skipping blocked prefix: %s\n", prefix)
+        return nil,nil
+    }
+
+	// Check if this prefix is a supernet of any blocked prefixes
+    // if so, add them to the blocklist of the generator and indicate
+    // that the generator contains blocklisted networks/IPs
+	var relevantBlocklist []*net.IPNet
+	hasBlockedIPs := false
+	for _, blocked := range blocklist {
+		if network.Contains(blocked.IP) {
+			relevantBlocklist = append(relevantBlocklist, blocked)
+			hasBlockedIPs = true
+		}
 	}
 
 	networkPrefixSize, _ := network.Mask.Size()
@@ -183,6 +274,8 @@ func createSubnetGenerator(prefix string, targetPrefixSize int, n int64, mode st
 			prng:          prng,
 			done:          false,
 			mode:          mode,
+            hasBlockedIPs: hasBlockedIPs,
+            blocklist:     relevantBlocklist,
 		}, nil
 	}
 
@@ -216,6 +309,8 @@ func createSubnetGenerator(prefix string, targetPrefixSize int, n int64, mode st
 		prng:          prng,
 		done:          false,
 		mode:          mode,
+		hasBlockedIPs: hasBlockedIPs,
+		blocklist:     relevantBlocklist,
 	}, nil
 }
 
@@ -243,19 +338,8 @@ type Arguments struct {
 	PerPrefixLimit   int64
 	TotalLimit       int64
 	Seed             int64
+    BlocklistFile    string
 }
-
-/*func parseArguments() Arguments {
-	args := Arguments{}
-	flag.StringVar(&args.PrefixFile, "prefix-file", "", "Path to input prefix file")
-	flag.IntVar(&args.TargetSubnetSize, "target-subnet-size", 48, "Target size of generated subnets (default 48)")
-	flag.StringVar(&args.Mode, "mode", "n", "Operating mode -- generate network (n, default), random (r), or both (b) addresses")
-	flag.Int64Var(&args.Seed, "seed", 1337371717283484832, "Random seed for LCG (optional, default is 1337371717283484832)")
-	flag.Int64Var(&args.PerSubnetLimit, "limit-per-prefix", -1, "Limit number of generated subnets per prefix (-1 -> no limit, default)")
-	flag.Int64Var(&args.TotalLimit, "total-limit", -1, "Limit number of generated subnets globally (-1 -> no limit, default)")
-	flag.Parse()
-	return args
-}*/
 
 func parseArguments() Arguments {
 	args := Arguments{}
@@ -267,6 +351,7 @@ func parseArguments() Arguments {
 	flag.Int64Var(&args.Seed, "seed", 1337371717283484832, "Random seed for LCG (optional, default is 1337371717283484832)")
 	flag.Int64Var(&args.PerPrefixLimit, "limit-per-prefix", -1, "Limit number of generated subnets per prefix (-1 -> no limit, default)")
 	flag.Int64Var(&args.TotalLimit, "total-limit", -1, "Limit number of generated subnets globally (-1 -> no limit, default)")
+    flag.StringVar(&args.BlocklistFile, "blocklist-file","config/blocklist.conf","Path to blocklist file")
 	flag.Parse()
 
 	if args.ConfigFile != "" {
@@ -294,9 +379,19 @@ func main() {
 
 	if args.PrefixFile == "" {
 		fmt.Println("[*] No input file in CIDR prefix notation provided. (--prefix-file/Prefix-File)")
-		fmt.Println("Usage: go run sra_generation_cyclic-v4.go --prefix-file <file> --target-subnet-size <target size> --mode <n (default), r, b> --limit-per-prefix <int, default -1 (no limit) --total-limit <max. amount of generated subnets> --seed <seed for lcg>")
+		fmt.Println("Usage: go run sra_generation_cyclic-v4.go --prefix-file <file> --target-subnet-size <target size> --mode <n (default), r, b> --limit-per-prefix <int, default -1 (no limit) --total-limit <max. amount of generated subnets> --seed <seed for lcg> --blocklist-file <path to blocklist file>")
 		fmt.Println("   Or: go run sra_generation_cyclic-v4.go --config-file <file>")
 		return
+	}
+
+	var blocklist []*net.IPNet
+	if args.BlocklistFile != "" {
+		var err error
+		blocklist, err = readBlocklist(args.BlocklistFile)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
 	}
 
 	file, err := os.Open(args.PrefixFile)
@@ -314,16 +409,20 @@ func main() {
 	var generators []*subnetGenerator
 	for scanner.Scan() {
 		prefix := strings.TrimSpace(scanner.Text())
-		gen, err := createSubnetGenerator(prefix, args.TargetSubnetSize, args.PerPrefixLimit, args.Mode)
+		gen, err := createSubnetGenerator(prefix, args.TargetSubnetSize, args.PerPrefixLimit, args.Mode, blocklist)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating subnet generator: %s\n", err)
 			return
 		}
+        if gen == nil {
+            //fmt.Fprintf(os.Stderr, "Skipping prefix %s (has supernet on blocklist)\n",prefix)
+            continue
+        }
 		generators = append(generators, gen)
 	}
 
 	if len(generators) == 0 {
-		fmt.Println("No valid prefixes provided.")
+		fmt.Fprintf(os.Stderr, "No valid prefixes provided.")
 		return
 	}
 	//fmt.Println(len(generators))
