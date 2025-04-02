@@ -5,6 +5,6 @@
   "Seed": 133371717287384832,
   "PerPrefixLimit": 2,
   "TotalLimit": 100,
-  "BlocklistFile": "config/blocklist.conf2"
+  "BlocklistFile": "config/blocklist.conf"
 }
 
